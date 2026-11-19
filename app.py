@@ -1,154 +1,393 @@
 
+import streamlit as st
 import os
 import re
-import io
 import json
 import time
 import signal
+import shutil
 import zipfile
 import tempfile
 import subprocess
-import streamlit as st
+import urllib.request
 
+from pathlib import Path
 from google import genai
+from google.genai import types
 import imageio_ffmpeg
 
 
+# ----------------------------
+# APP SETTINGS
+# ----------------------------
+
 st.set_page_config(
-    page_title="AI Live Clipper",
+    page_title="AI YouTube Clipper",
     page_icon="🎬",
-    layout="centered"
+    layout="wide"
 )
 
-st.title("🎬 AI YouTube Live Clipper")
-st.write("LIVE stream record karo aur AI se Shorts banao.")
+st.title("🎬 AI YouTube Clipper")
+st.write("YouTube video ya LIVE record karo aur AI se Shorts banao.")
 
-# API KEY
-api_key = st.secrets.get("GEMINI_API_KEY", "")
-
-if not api_key:
-    st.error("Gemini API Key missing hai. Cloud Secrets mein add karo.")
-    st.stop()
-
-client = genai.Client(api_key=api_key)
-ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+WORK_DIR = Path(tempfile.gettempdir()) / "ai_clipper"
+WORK_DIR.mkdir(exist_ok=True)
 
 
-# -------------------------
-# HELPER FUNCTIONS
-# -------------------------
+# ----------------------------
+# DENO INSTALLER
+# ----------------------------
 
-def get_video_files(folder):
-    files = []
+@st.cache_resource(show_spinner=False)
+def install_deno():
+    deno_folder = Path(tempfile.gettempdir()) / "deno_runtime"
+    deno_path = deno_folder / "deno"
 
-    for name in os.listdir(folder):
-        path = os.path.join(folder, name)
+    if deno_path.exists():
+        return str(deno_path)
 
-        if name.startswith("capture.") and os.path.isfile(path):
-            if not name.endswith((".part", ".ytdl")):
-                if os.path.getsize(path) > 100000:
-                    files.append(path)
+    deno_folder.mkdir(parents=True, exist_ok=True)
 
-    return files
+    zip_path = deno_folder / "deno.zip"
+
+    url = (
+        "https://github.com/denoland/deno/releases/"
+        "latest/download/deno-x86_64-unknown-linux-gnu.zip"
+    )
+
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "AI-YouTube-Clipper"}
+        )
+
+        with urllib.request.urlopen(request, timeout=120) as response:
+            zip_path.write_bytes(response.read())
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extract("deno", deno_folder)
+
+        deno_path.chmod(0o755)
+        zip_path.unlink(missing_ok=True)
+
+        return str(deno_path)
+
+    except Exception as e:
+        raise RuntimeError(
+            "Deno install nahi ho paya. Internet ya GitHub download "
+            "block ho sakta hai. Error: " + str(e)
+        )
 
 
-def record_live(url, folder, seconds, status):
-    output = os.path.join(folder, "capture.%(ext)s")
-    log_path = os.path.join(folder, "recording.log")
+# ----------------------------
+# YOUTUBE DOWNLOAD
+# ----------------------------
 
-    command = [
-    "yt-dlp",
-    "--remote-components",
-    "ejs:npm",
+def get_ytdlp_command():
+    deno = install_deno()
+
+    return [
+        "yt-dlp",
+        "--js-runtimes",
+        f"deno:{deno}",
+        "--remote-components",
+        "ejs:npm"
+    ]
+
+
+def download_normal(url, output_folder):
+    output_template = str(output_folder / "video.%(ext)s")
+
+    command = get_ytdlp_command() + [
         "--no-playlist",
-        "--no-part",
-        "--newline",
-        "-f",
-"best[height<=480]/best",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        output,
+        "--no-warnings",
+        "-f", "best",
+        "--merge-output-format", "mp4",
+        "-o", output_template,
         url
     ]
 
-    start = time.time()
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=3600
+    )
 
-    with open(log_path, "w") as log:
-        process = subprocess.Popen(
-            command,
-            stdout=log,
-            stderr=subprocess.STDOUT
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr[-4000:] or "YouTube download failed."
         )
 
-        try:
-            while time.time() - start < seconds:
-                if process.poll() is not None:
-                    break
-
-                elapsed = int(time.time() - start)
-                remaining = max(0, seconds - elapsed)
-
-                hours = elapsed // 3600
-                minutes = (elapsed % 3600) // 60
-                secs = elapsed % 60
-
-                status.update(
-                    label=(
-                        f"Recording LIVE: "
-                        f"{hours:02d}:{minutes:02d}:{secs:02d}"
-                    ),
-                    state="running"
-                )
-
-                time.sleep(5)
-
-        finally:
-            if process.poll() is None:
-                process.send_signal(signal.SIGINT)
-
-                try:
-                    process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    process.terminate()
-
-                    try:
-                        process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-
-    files = get_video_files(folder)
+    files = list(output_folder.glob("video.*"))
+    files = [f for f in files if f.is_file() and f.suffix != ".part"]
 
     if not files:
-        with open(log_path, "r") as f:
-            error = f.read()
+        raise RuntimeError("Downloaded video file nahi mili.")
 
-        raise Exception(
-            "LIVE recording file nahi mili.\n" + error[-4000:]
+    return files[0]
+
+
+def record_live(url, minutes, output_folder):
+    output_file = output_folder / "live_recording.%(ext)s"
+
+    command = get_ytdlp_command() + [
+        "--no-playlist",
+        "--no-part",
+        "--no-warnings",
+        "-f", "best",
+        "-o", str(output_file),
+        url
+    ]
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    log_lines = []
+    start_time = time.time()
+    duration_seconds = minutes * 60
+
+    try:
+        while time.time() - start_time < duration_seconds:
+            line = process.stdout.readline()
+
+            if line:
+                log_lines.append(line.strip())
+                if len(log_lines) > 30:
+                    log_lines.pop(0)
+
+            if process.poll() is not None:
+                break
+
+            time.sleep(0.2)
+
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+
+            try:
+                process.wait(timeout=40)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    files = list(output_folder.glob("live_recording.*"))
+    files = [
+        f for f in files
+        if f.is_file()
+        and f.suffix not in [".part", ".ytdl"]
+    ]
+
+    if not files:
+        raise RuntimeError(
+            "LIVE recording file nahi bani.\n\n"
+            + "\n".join(log_lines[-15:])
         )
 
-    video = max(files, key=os.path.getsize)
-
-    if os.path.getsize(video) < 100000:
-        raise Exception("Recording file bahut chhoti ya incomplete hai.")
-
-    return video
+    return files[0]
 
 
-def download_normal(url, folder):
-    output = os.path.join(folder, "capture.%(ext)s")
+# ----------------------------
+# VIDEO INFORMATION
+# ----------------------------
+
+def get_duration(video_path):
+    command = [
+        FFMPEG.replace("ffmpeg", "ffprobe"),
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path)
+    ]
+
+    # imageio-ffmpeg may not provide ffprobe, so use ffmpeg fallback
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ----------------------------
+# SPLIT VIDEO INTO CHUNKS
+# ----------------------------
+
+def make_chunks(video_path, folder, chunk_minutes=10):
+    chunk_seconds = chunk_minutes * 60
+    chunks = []
+
+    duration = get_duration(video_path)
+
+    if not duration:
+        raise RuntimeError(
+            "Video duration read nahi ho payi. FFmpeg error ho sakta hai."
+        )
+
+    start = 0
+    number = 1
+
+    while start < duration:
+        output = folder / f"chunk_{number}.mp4"
+
+        command = [
+            FFMPEG,
+            "-y",
+            "-ss", str(start),
+            "-i", str(video_path),
+            "-t", str(chunk_seconds),
+            "-c", "copy",
+            str(output)
+        ]
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=900
+        )
+
+        if result.returncode == 0 and output.exists():
+            chunks.append((output, start))
+
+        start += chunk_seconds
+        number += 1
+
+    if not chunks:
+        raise RuntimeError("Video chunks nahi ban paye.")
+
+    return chunks
+
+
+# ----------------------------
+# GEMINI ANALYSIS
+# ----------------------------
+
+def get_gemini_client():
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+
+    if not api_key:
+        raise RuntimeError(
+            "Gemini API key nahi mili. Streamlit Secrets mein "
+            "GEMINI_API_KEY add karo."
+        )
+
+    return genai.Client(api_key=api_key)
+
+
+def analyze_chunk(client, chunk_path, offset, clip_count, clip_seconds):
+    uploaded = client.files.upload(file=str(chunk_path))
+
+    try:
+        while uploaded.state.name == "PROCESSING":
+            time.sleep(5)
+            uploaded = client.files.get(name=uploaded.name)
+
+        if uploaded.state.name == "FAILED":
+            raise RuntimeError("Gemini video process nahi kar paya.")
+
+        prompt = f"""
+        Analyze this video and find the {clip_count} most interesting,
+        entertaining or important moments suitable for YouTube Shorts.
+
+        Each clip should be approximately {clip_seconds} seconds long.
+
+        Return ONLY valid JSON in this format:
+        {{
+          "clips": [
+            {{
+              "start": 10,
+              "end": 40,
+              "title": "Interesting moment",
+              "reason": "Why this moment is worth watching"
+            }}
+          ]
+        }}
+
+        Rules:
+        - Start and end must be seconds inside THIS uploaded video.
+        - End must be greater than start.
+        - Do not invent moments.
+        - Avoid duplicate moments.
+        - Keep clips within the video duration.
+        - Prefer moments with a clear beginning and ending.
+        """
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[uploaded, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+
+        data = json.loads(response.text)
+
+        clips = []
+
+        for clip in data.get("clips", []):
+            start = float(clip["start"]) + offset
+            end = float(clip["end"]) + offset
+
+            if end > start:
+                clips.append({
+                    "start": start,
+                    "end": end,
+                    "title": str(clip.get("title", "AI Clip")),
+                    "reason": str(clip.get("reason", ""))
+                })
+
+        return clips
+
+    finally:
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+
+# ----------------------------
+# CREATE VERTICAL SHORTS
+# ----------------------------
+
+def create_clip(video_path, clip, output_path):
+    start = clip["start"]
+    duration = clip["end"] - clip["start"]
 
     command = [
-        "yt-dlp",
-        "--no-playlist",
-        "-f",
-        "best[height<=480][ext=mp4]/best[height<=480]/best",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        output,
-        url
+        FFMPEG,
+        "-y",
+        "-ss", str(start),
+        "-i", str(video_path),
+        "-t", str(duration),
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "24",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path)
     ]
 
     result = subprocess.run(
@@ -159,448 +398,214 @@ def download_normal(url, folder):
     )
 
     if result.returncode != 0:
-        raise Exception(result.stderr[-4000:])
+        raise RuntimeError(result.stderr[-2000:])
 
-    files = get_video_files(folder)
-
-    if not files:
-        raise Exception("Video download nahi hui.")
-
-    return max(files, key=os.path.getsize)
+    return output_path
 
 
-def get_duration(video):
-    result = subprocess.run(
-        [ffmpeg, "-i", video],
-        capture_output=True,
-        text=True
-    )
+# ----------------------------
+# USER INTERFACE
+# ----------------------------
 
-    text = result.stderr
+st.subheader("1. Video source")
 
-    match = re.search(
-        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
-        text
-    )
+source = st.radio(
+    "Video kaise dena hai?",
+    ["YouTube video link", "YouTube LIVE recording", "Upload video"],
+    horizontal=False
+)
 
-    if not match:
-        raise Exception("Video ki duration read nahi ho payi.")
+url = ""
+uploaded_video = None
 
-    h, m, s = match.groups()
+if source == "YouTube video link":
+    url = st.text_input("YouTube video URL")
 
-    return int(float(h) * 3600 + int(m) * 60 + float(s))
+elif source == "YouTube LIVE recording":
+    url = st.text_input("YouTube LIVE URL")
 
-
-def make_chunks(video, folder, duration):
-    chunk_length = 600
-    chunks = []
-
-    total_chunks = (duration + chunk_length - 1) // chunk_length
-
-    for index in range(total_chunks):
-        start = index * chunk_length
-        length = min(chunk_length, duration - start)
-
-        output = os.path.join(
-            folder,
-            f"analysis_{index + 1}.mp4"
+    recording_minutes = st.selectbox(
+        "Kitni der record karna hai?",
+        [30, 60, 120, 180, 240],
+        format_func=lambda x: (
+            f"{x} minutes" if x < 60 else f"{x // 60} hour"
+            if x == 60 else f"{x // 60} hours"
         )
-
-        command = [
-            ffmpeg,
-            "-y",
-            "-ss", str(start),
-            "-i", video,
-            "-t", str(length),
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            output
-        ]
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-
-        if result.returncode != 0 or not os.path.exists(output):
-            raise Exception(
-                "Video chunk nahi ban paya:\n" +
-                result.stderr[-3000:]
-            )
-
-        if os.path.getsize(output) > 100000:
-            chunks.append((output, start, length))
-
-    return chunks
-
-
-def analyze_chunk(chunk_path, offset, length, clip_seconds):
-    uploaded = client.files.upload(file=chunk_path)
-
-    for _ in range(120):
-        uploaded = client.files.get(name=uploaded.name)
-
-        if uploaded.state and uploaded.state.name == "ACTIVE":
-            break
-
-        if uploaded.state and uploaded.state.name == "FAILED":
-            raise Exception("Gemini video processing failed.")
-
-        time.sleep(5)
-    else:
-        raise Exception("Gemini video processing timeout.")
-
-    prompt = f"""
-    Analyze this video carefully and find interesting moments
-    suitable for viral YouTube Shorts.
-
-    Return ONLY valid JSON in this format:
-
-    {{
-      "clips": [
-        {{
-          "title": "Short title",
-          "start_sec": 20,
-          "end_sec": 50,
-          "score": 9
-        }}
-      ]
-    }}
-
-    RULES:
-    - Each clip must be exactly about {clip_seconds} seconds.
-    - Find up to 3 good moments in this chunk.
-    - start_sec and end_sec must be relative to this chunk.
-    - Never go outside this chunk's duration of {length} seconds.
-    - Do not invent events.
-    - Score each clip from 1 to 10.
-    - Return valid JSON only.
-    """
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[uploaded, prompt]
     )
 
-    text = response.text or ""
-
-    match = re.search(
-        r"\{.*\}",
-        text,
-        re.DOTALL
-    )
-
-    if not match:
-        return []
-
-    data = json.loads(match.group(0))
-    candidates = []
-
-    for item in data.get("clips", []):
-        try:
-            start = float(item["start_sec"])
-            end = float(item["end_sec"])
-
-            if (
-                start >= 0
-                and end > start
-                and end - start <= clip_seconds + 5
-                and end <= length
-            ):
-                candidates.append({
-                    "title": str(item.get("title", "AI Short")),
-                    "start": offset + start,
-                    "end": offset + end,
-                    "score": float(item.get("score", 5))
-                })
-
-        except (ValueError, TypeError, KeyError):
-            continue
-
-    return candidates
-
-
-def create_clip(video, start, end, output):
-    command = [
-        ffmpeg,
-        "-y",
-        "-ss", str(start),
-        "-i", video,
-        "-t", str(end - start),
-        "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "25",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        output
-    ]
-
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=600
-    )
-
-    if result.returncode != 0:
-        raise Exception(result.stderr[-3000:])
-
-
-# -------------------------
-# APP OPTIONS
-# -------------------------
-
-url = st.text_input(
-    "YouTube LIVE / Video Link",
-    placeholder="https://www.youtube.com/watch?v=..."
-)
-
-record_choice = st.selectbox(
-    "Kitni der recording karni hai?",
-    [
-        "30 minutes",
-        "1 hour",
-        "2 hours",
-        "3 hours",
-        "4 hours",
-        "Custom"
-    ]
-)
-
-record_times = {
-    "30 minutes": 30,
-    "1 hour": 60,
-    "2 hours": 120,
-    "3 hours": 180,
-    "4 hours": 240
-}
-
-if record_choice == "Custom":
-    record_minutes = st.number_input(
-        "Recording minutes",
-        min_value=1,
-        max_value=240,
-        value=60
-    )
 else:
-    record_minutes = record_times[record_choice]
+    uploaded_video = st.file_uploader(
+        "Video upload karo",
+        type=["mp4", "mov", "mkv", "webm"]
+    )
 
-clip_count_choice = st.selectbox(
-    "Kitni clips banani hain?",
-    ["5", "10", "20", "Custom"]
+
+st.subheader("2. Shorts settings")
+
+clip_count = st.selectbox(
+    "Kitne clips banane hain?",
+    [5, 10, 20]
 )
 
-if clip_count_choice == "Custom":
-    clip_count = st.number_input(
-        "Clips ki quantity",
-        min_value=1,
-        max_value=50,
-        value=5
-    )
-else:
-    clip_count = int(clip_count_choice)
-
-clip_length_choice = st.selectbox(
+clip_seconds = st.selectbox(
     "Har clip kitne seconds ki ho?",
-    ["30 seconds", "45 seconds", "60 seconds", "Custom"]
+    [30, 45, 60]
 )
 
-if clip_length_choice == "Custom":
-    clip_seconds = st.number_input(
-        "Custom clip seconds",
-        min_value=10,
-        max_value=180,
-        value=30
-    )
-else:
-    clip_seconds = int(clip_length_choice.split()[0])
-
-
-st.info(
-    "LIVE recording current point se start hogi. "
-    "Recording khatam hone ke baad AI clips banayega."
+st.caption(
+    "Note: Gemini AI available moments ke hisaab se clips banaega. "
+    "Har video mein exact requested number milna guaranteed nahi hai."
 )
 
 
-# -------------------------
-# START BUTTON
-# -------------------------
+# ----------------------------
+# PROCESS BUTTON
+# ----------------------------
 
-if st.button("🚀 Start Recording & Generate Clips", type="primary"):
+if st.button("🚀 Start AI Clipping", type="primary"):
 
-    if not url.startswith((
-        "https://www.youtube.com/",
-        "https://youtu.be/",
-        "https://youtube.com/"
-    )):
-        st.error("Valid YouTube link enter karo.")
+    if source in ["YouTube video link", "YouTube LIVE recording"] and not url.strip():
+        st.error("Pehle YouTube link paste karo.")
+
+    elif source == "Upload video" and uploaded_video is None:
+        st.error("Pehle video upload karo.")
 
     else:
+        session_folder = Path(
+            tempfile.mkdtemp(prefix="clipper_")
+        )
+
         try:
-            with tempfile.TemporaryDirectory() as temp:
+            with st.spinner("Video prepare ho rahi hai..."):
 
-                status = st.status(
-                    "LIVE recording start ho rahi hai...",
-                    expanded=True
-                )
+                if source == "YouTube video link":
+                    video_path = download_normal(
+                        url.strip(),
+                        session_folder
+                    )
 
-                st.write(
-                    f"Recording time: {record_minutes} minutes"
-                )
+                elif source == "YouTube LIVE recording":
+                    st.info(
+                        "Recording abhi shuru hogi. App ko band mat karna."
+                    )
 
-                video = record_live(
-                    url,
-                    temp,
-                    int(record_minutes * 60),
-                    status
-                )
+                    video_path = record_live(
+                        url.strip(),
+                        recording_minutes,
+                        session_folder
+                    )
 
-                status.update(
-                    label="Recording complete!",
-                    state="complete"
-                )
+                else:
+                    video_path = session_folder / uploaded_video.name
 
-                st.success("LIVE recording save ho gayi.")
+                    with open(video_path, "wb") as f:
+                        f.write(uploaded_video.getbuffer())
 
-                duration = get_duration(video)
+            st.success("Video ready ho gayi!")
 
-                st.write(
-                    f"Recorded video duration: "
-                    f"{duration // 3600}h "
-                    f"{(duration % 3600) // 60}m"
-                )
+            st.video(str(video_path))
 
-                st.write("Video ko 10-minute parts mein divide kar rahe hain...")
-
+            with st.spinner("Video ko 10-minute parts mein divide kar rahe hain..."):
                 chunks = make_chunks(
-                    video,
-                    temp,
-                    duration
+                    video_path,
+                    session_folder
                 )
 
-                if not chunks:
-                    raise Exception("Analysis ke liye video parts nahi mile.")
+            st.write(f"Total video parts: {len(chunks)}")
 
-                candidates = []
+            client = get_gemini_client()
+            all_clips = []
 
-                progress = st.progress(0)
-                message = st.empty()
+            progress = st.progress(0)
 
-                for index, (chunk, offset, length) in enumerate(chunks):
+            for index, (chunk_path, offset) in enumerate(chunks):
+                st.write(f"AI analysis: Part {index + 1}/{len(chunks)}")
 
-                    message.write(
-                        f"AI analysis: Part {index + 1} / {len(chunks)}"
+                remaining = clip_count - len(all_clips)
+
+                if remaining <= 0:
+                    break
+
+                clips = analyze_chunk(
+                    client,
+                    chunk_path,
+                    offset,
+                    remaining,
+                    clip_seconds
+                )
+
+                all_clips.extend(clips)
+                progress.progress((index + 1) / len(chunks))
+
+            # Sort and remove overlapping clips
+            all_clips.sort(key=lambda x: x["start"])
+
+            selected = []
+            for clip in all_clips:
+                if len(selected) >= clip_count:
+                    break
+
+                if not selected or clip["start"] >= selected[-1]["end"]:
+                    selected.append(clip)
+
+            if not selected:
+                raise RuntimeError(
+                    "AI ko suitable clips nahi mile. Dusri video try karo."
+                )
+
+            st.subheader("3. Creating Shorts")
+
+            clips_folder = session_folder / "shorts"
+            clips_folder.mkdir(exist_ok=True)
+
+            zip_path = session_folder / "shorts.zip"
+
+            for index, clip in enumerate(selected, start=1):
+                output = clips_folder / f"short_{index}.mp4"
+
+                with st.spinner(f"Short {index} ban rahi hai..."):
+                    create_clip(video_path, clip, output)
+
+                st.markdown(f"**Short {index}: {clip['title']}**")
+                st.caption(clip["reason"])
+                st.video(str(output))
+
+                with open(output, "rb") as file:
+                    st.download_button(
+                        f"⬇️ Download Short {index}",
+                        data=file.read(),
+                        file_name=f"short_{index}.mp4",
+                        mime="video/mp4",
+                        key=f"download_{index}"
                     )
 
-                    found = analyze_chunk(
-                        chunk,
-                        offset,
-                        length,
-                        int(clip_seconds)
-                    )
+            # ZIP creation
+            with zipfile.ZipFile(
+                zip_path,
+                "w",
+                zipfile.ZIP_DEFLATED
+            ) as zip_file:
 
-                    candidates.extend(found)
-                    progress.progress((index + 1) / len(chunks))
+                for file in clips_folder.glob("*.mp4"):
+                    zip_file.write(file, arcname=file.name)
 
-                    os.remove(chunk)
-
-                # Highest scoring candidates first
-                candidates.sort(
-                    key=lambda x: x["score"],
-                    reverse=True
-                )
-
-                selected = []
-
-                for item in candidates:
-                    overlaps = False
-
-                    for old in selected:
-                        if (
-                            item["start"] < old["end"]
-                            and item["end"] > old["start"]
-                        ):
-                            overlaps = True
-                            break
-
-                    if not overlaps:
-                        selected.append(item)
-
-                    if len(selected) >= int(clip_count):
-                        break
-
-                if not selected:
-                    raise Exception("AI ko suitable clips nahi mile.")
-
-                st.success(
-                    f"{len(selected)} clips select hui hain."
-                )
-
-                zip_buffer = io.BytesIO()
-
-                with zipfile.ZipFile(
-                    zip_buffer,
-                    "w",
-                    zipfile.ZIP_DEFLATED
-                ) as zip_file:
-
-                    for index, item in enumerate(selected, start=1):
-
-                        output = os.path.join(
-                            temp,
-                            f"short_{index}.mp4"
-                        )
-
-                        st.write(
-                            f"Creating clip {index}: {item['title']}"
-                        )
-
-                        create_clip(
-                            video,
-                            item["start"],
-                            item["end"],
-                            output
-                        )
-
-                        with open(output, "rb") as f:
-                            clip_data = f.read()
-
-                        zip_file.writestr(
-                            f"clip_{index}.mp4",
-                            clip_data
-                        )
-
-                        st.subheader(
-                            f"Clip {index}: {item['title']}"
-                        )
-
-                        st.video(clip_data)
-
-                        st.download_button(
-                            f"⬇️ Download Clip {index}",
-                            data=clip_data,
-                            file_name=f"short_{index}.mp4",
-                            mime="video/mp4",
-                            key=f"download_{index}"
-                        )
-
+            with open(zip_path, "rb") as file:
                 st.download_button(
-                    "📦 Download All Clips (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="AI_YouTube_Clips.zip",
+                    "📦 Download All Shorts (ZIP)",
+                    data=file.read(),
+                    file_name="youtube_shorts.zip",
                     mime="application/zip"
                 )
 
-        except subprocess.TimeoutExpired:
-            st.error("Process timeout ho gaya. Chhoti recording try karo.")
+            st.success(
+                f"Done! {len(selected)} Shorts ready hain."
+            )
 
         except Exception as e:
-            st.error("Something went wrong:")
-            st.code(str(e)[-5000:])
+            st.error("Error aa gaya:")
+            st.code(str(e))
+
+            st.info(
+                "Agar YouTube download fail ho, error ka screenshot "
+                "bhejo. API key ya password screenshot mein mat dikhana."
+            )
