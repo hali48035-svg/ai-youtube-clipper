@@ -3,6 +3,5 @@ streamlit
 google-genai
 yt-dlp[default]
 imageio-ffmpeg
-deno-bin
 
 
