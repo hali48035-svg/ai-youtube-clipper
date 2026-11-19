@@ -62,7 +62,7 @@ def record_live(url, folder, seconds, status):
         "--no-part",
         "--newline",
         "-f",
-        "best[height<=480][ext=mp4]/best[height<=480]/best",
+"best[height<=480]/best",
         "--merge-output-format",
         "mp4",
         "-o",
