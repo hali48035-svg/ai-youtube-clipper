@@ -57,7 +57,9 @@ def record_live(url, folder, seconds, status):
     log_path = os.path.join(folder, "recording.log")
 
     command = [
-        "yt-dlp",
+    "yt-dlp",
+    "--remote-components",
+    "ejs:npm",
         "--no-playlist",
         "--no-part",
         "--newline",
