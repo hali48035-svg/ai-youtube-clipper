@@ -1,7 +1,6 @@
+
 streamlit
-
 google-genai
-
-yt-dlp
-
+yt-dlp[default]
 imageio-ffmpeg
+
