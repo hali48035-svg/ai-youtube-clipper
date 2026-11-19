@@ -54,19 +54,26 @@ if st.button("🚀 Generate AI Clips"):
 
                 output = os.path.join(temp, "video.%(ext)s")
 
-                subprocess.run([
+                
+result = subprocess.run(
+    [
+        "yt-dlp",
+        "--no-playlist",
+        "--verbose",
+        "-f", "best[height<=720]/best",
+        "-o", output,
+        url
+    ],
+    capture_output=True,
+    text=True,
+    timeout=600
+)
 
-                    "yt-dlp",
+if result.returncode != 0:
+    st.error("YouTube video download failed!")
+    st.code(result.stderr[-5000:])
+    st.stop()
 
-                    "--no-playlist",
-
-                    "-f", "best[height<=720]/best",
-
-                    "-o", output,
-
-                    url
-
-                ], check=True, timeout=600)
 
                 videos = [
 
